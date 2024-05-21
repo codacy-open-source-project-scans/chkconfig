@@ -106,11 +106,11 @@ static int usage(int rc) {
     exit(rc);
 }
 
-/* 
+/*
  * Function to clean path form unnecessary backslashes
  * It will make from //abcd///efgh/ -> /abcd/efgh/
  */
-const char *normalize_path(const char *s) {
+char *normalize_path(char *s) {
     if (s) {
         const char *src = s;
         char *dst = (char *)s;
@@ -120,8 +120,13 @@ const char *normalize_path(const char *s) {
             } while (*dst == '/' && *src == '/');
             dst++;
         }
-    }  
-    return (const char *)s;
+    }
+    return s;
+}
+
+char *normalize_path_alloc(const char *s) {
+    char *ret = strdup(s);
+    return normalize_path(ret);
 }
 
 int streq(const char *a, const char *b) {
@@ -132,6 +137,12 @@ int streq(const char *a, const char *b) {
         return 1;
 
     return 0;
+}
+
+char * strsteal(char **ptr) {
+    char *ret = *ptr;
+    *ptr = NULL;
+    return ret;
 }
 
 int altBetter(struct alternative new, struct alternative old, char *family) {
@@ -191,7 +202,7 @@ static void setupDoubleArg(enum programModes *mode, const char ***nextArgPtr,
 
     if (!*nextArg)
         usage(2);
-    *target = strdup(normalize_path(*nextArg));
+    *target = normalize_path_alloc(*nextArg);
     *nextArgPtr = nextArg + 1;
 }
 
@@ -212,7 +223,7 @@ static void setupTripleArg(enum programModes *mode, const char ***nextArgPtr,
 
     if (!*nextArg)
         usage(2);
-    *target = strdup(normalize_path(*nextArg));
+    *target = normalize_path_alloc(*nextArg);
     nextArg++;
 
     if (!*nextArg)
@@ -226,7 +237,7 @@ static void setupLinkSet(struct linkSet *set, const char ***nextArgPtr) {
 
     if (!*nextArg || **nextArg != '/')
         usage(2);
-    set->facility = strdup(normalize_path(*nextArg));
+    set->facility = normalize_path_alloc(*nextArg);
     nextArg++;
 
     if (!*nextArg || **nextArg == '/')
@@ -236,7 +247,7 @@ static void setupLinkSet(struct linkSet *set, const char ***nextArgPtr) {
 
     if (!*nextArg || **nextArg != '/')
         usage(2);
-    set->target = strdup(normalize_path(*nextArg));
+    set->target = normalize_path_alloc(*nextArg);
     *nextArgPtr = nextArg + 1;
 }
 
@@ -261,6 +272,11 @@ char *parseLine(char **buf) {
     return strdup(start);
 }
 
+void nextLine(char **buf, char **line) {
+    free(*line);
+    *line = parseLine(buf);
+}
+
 static int readConfig(struct alternativeSet *set, const char *title,
                       const char *altDir, const char *stateDir, int flags) {
     char *path;
@@ -270,13 +286,15 @@ static int readConfig(struct alternativeSet *set, const char *title,
     struct stat sb;
     char *buf;
     char *end;
-    char *line;
+    char *line = NULL;
+    char *ptr;
     struct {
         char *facility;
         char *title;
     } *groups = NULL;
     int numGroups = 0;
     char linkBuf[PATH_MAX];
+    int r = 0;
 
     set->alts = NULL;
     set->numAlts = 0;
@@ -309,10 +327,11 @@ static int readConfig(struct alternativeSet *set, const char *title,
     close(fd);
     buf[sb.st_size] = '\0';
 
-    line = parseLine(&buf);
+    nextLine(&buf, &line);
     if (!line) {
         fprintf(stderr, _("%s empty!\n"), path);
-        return 1;
+        r = 1;
+        goto finish;
     }
 
     if (!strcmp(line, "auto")) {
@@ -321,60 +340,65 @@ static int readConfig(struct alternativeSet *set, const char *title,
         set->mode = MANUAL;
     } else {
         fprintf(stderr, _("bad mode on line 1 of %s\n"), path);
-        return 1;
+        r = 1;
+        goto finish;
     }
-    free(line);
 
-    line = parseLine(&buf);
+    nextLine(&buf, &line);
     if (!line || *line != '/') {
         fprintf(stderr, _("bad primary link in %s\n"), path);
-        return 1;
+        r = 1;
+        goto finish;
     }
 
     groups = realloc(groups, sizeof(*groups));
     groups[0].title = strdup(title);
-    groups[0].facility = line;
+    groups[0].facility = strsteal(&line);
     numGroups = 1;
 
-    line = parseLine(&buf);
+    nextLine(&buf, &line);
     while (line && *line) {
         if (*line == '/') {
             fprintf(stderr, _("path %s unexpected in %s\n"), line, path);
-            return 1;
+            r = 1;
+            goto finish;
         }
 
         groups = realloc(groups, sizeof(*groups) * (numGroups + 1));
-        groups[numGroups].title = line;
+        groups[numGroups].title = strsteal(&line);
 
-        line = parseLine(&buf);
+        nextLine(&buf, &line);
         if (!line || !*line) {
             fprintf(stderr, _("missing path for follower %s in %s\n"), line, path);
-            return 1;
+            r = 1;
+            goto finish;
         }
 
-        groups[numGroups++].facility = line;
+        groups[numGroups++].facility = strsteal(&line);
 
-        line = parseLine(&buf);
+        nextLine(&buf, &line);
     }
 
     if (!line) {
         fprintf(stderr, _("unexpected end of file in %s\n"), path);
-        return 1;
+        r = 1;
+        goto finish;
     }
 
-    line = parseLine(&buf);
+    nextLine(&buf, &line);
     while (line && *line) {
         set->alts = realloc(set->alts, (set->numAlts + 1) * sizeof(*set->alts));
 
         if (*line != '/') {
             fprintf(stderr, _("path to alternate expected in %s\n"), path);
             fprintf(stderr, _("unexpected line in %s: %s\n"), path, line);
-            return 1;
+            r = 1;
+            goto finish;
         }
 
-        set->alts[set->numAlts].leader.facility = strdup(normalize_path(groups[0].facility));
+        set->alts[set->numAlts].leader.facility = normalize_path_alloc(groups[0].facility);
         set->alts[set->numAlts].leader.title = strdup(groups[0].title);
-        set->alts[set->numAlts].leader.target = line;
+        set->alts[set->numAlts].leader.target = strsteal(&line);
         set->alts[set->numAlts].numFollowers = numGroups - 1;
         if (numGroups > 1)
             set->alts[set->numAlts].followers = malloc(
@@ -382,32 +406,36 @@ static int readConfig(struct alternativeSet *set, const char *title,
         else
             set->alts[set->numAlts].followers = NULL;
 
-        line = parseLine(&buf);
         set->alts[set->numAlts].priority = -1;
         set->alts[set->numAlts].initscript = NULL;
         set->alts[set->numAlts].family = NULL;
 
-        if (line && line[0] == '@') {
-            line++;
-            end = strchr(line, '@');
-            if (!end || (end == line)) {
+        nextLine(&buf, &line);
+        ptr = line;
+
+        if (ptr && ptr[0] == '@') {
+            ptr++;
+            end = strchr(ptr, '@');
+            if (!end || (end == ptr)) {
                 fprintf(stderr,
                         _("closing '@' missing or the family is empty in %s\n"),
                         path);
                 fprintf(stderr, _("unexpected line in %s: %s\n"), path, line);
-                return 1;
+                r = 1;
+                goto finish;
             }
             *end = '\0';
-            set->alts[set->numAlts].family = strdup(line);
-            line = end + 1;
+            set->alts[set->numAlts].family = strdup(ptr);
+            ptr = end + 1;
         }
 
-        set->alts[set->numAlts].priority = strtol(line, &end, 0);
+        set->alts[set->numAlts].priority = strtol(ptr, &end, 0);
 
-        if (!end || (end == line)) {
+        if (!end || (end == ptr)) {
             fprintf(stderr, _("numeric priority expected in %s\n"), path);
             fprintf(stderr, _("unexpected line in %s: %s\n"), path, line);
-            return 1;
+            r = 1;
+            goto finish;
         }
         if (end) {
             while (*end && isspace(*end))
@@ -421,31 +449,33 @@ static int readConfig(struct alternativeSet *set, const char *title,
             set->best = set->numAlts;
 
         for (i = 1; i < numGroups; i++) {
-            line = parseLine(&buf);
+            nextLine(&buf, &line);
             if (line && strlen(line) && *line != '/') {
                 fprintf(stderr, _("follower path expected in %s\n"), path);
                 fprintf(stderr, _("unexpected line in %s: %s\n"), path, line);
-                return 1;
+                r = 1;
+                goto finish;
             }
 
             set->alts[set->numAlts].followers[i - 1].title =
                 strdup(groups[i].title);
             set->alts[set->numAlts].followers[i - 1].facility =
-                strdup(normalize_path(groups[i].facility));
+                normalize_path_alloc(groups[i].facility);
             set->alts[set->numAlts].followers[i - 1].target =
-                (line && strlen(line)) ? line : NULL;
+                (line && strlen(line)) ? strsteal(&line) : NULL;
         }
 
         set->numAlts++;
 
-        line = parseLine(&buf);
+        nextLine(&buf, &line);
     }
 
     while (line) {
-        line = parseLine(&buf);
+        nextLine(&buf, &line);
         if (line && *line) {
             fprintf(stderr, _("unexpected line in %s: %s\n"), path, line);
-            return 1;
+            r = 1;
+            goto finish;
         }
     }
 
@@ -455,7 +485,8 @@ static int readConfig(struct alternativeSet *set, const char *title,
     if (((i = readlink(leader_path, linkBuf, sizeof(linkBuf) - 1)) < 0)) {
         fprintf(stderr, _("failed to read link %s: %s\n"),
                 set->alts[0].leader.facility, strerror(errno));
-        return 2;
+        r = 2;
+        goto finish;
     }
 
     linkBuf[i] = '\0';
@@ -479,9 +510,15 @@ static int readConfig(struct alternativeSet *set, const char *title,
         set->current = i;
     }
 
-    set->currentLink = strdup(normalize_path(linkBuf));
-
-    return 0;
+    set->currentLink = normalize_path_alloc(linkBuf);
+finish:
+    for (i = 1; i < numGroups; i++) {
+        free(groups[i].title);
+        free(groups[i].facility);
+    }
+    free(groups);
+    free(line);
+    return r;
 }
 
 static int isLink(char *path) {
@@ -556,7 +593,7 @@ static int makeLinks(struct linkSet *l, const char *altDir, int flags) {
             printf(_("would link %s -> %s\n"), l->facility, sl);
         } else {
             memset(buf, 0, sizeof(buf));
-            readlink(l->facility, buf, sizeof(buf));
+            readlink(l->facility, buf, sizeof(buf)-1);
 
             if(!streq(sl, buf)) {
                 unlink(l->facility);
@@ -574,7 +611,7 @@ static int makeLinks(struct linkSet *l, const char *altDir, int flags) {
         printf(_("would link %s -> %s\n"), sl, l->target);
     } else {
         memset(buf, 0, sizeof(buf));
-        readlink(sl, buf, sizeof(buf));
+        readlink(sl, buf, sizeof(buf)-1);
 
         if(!streq(l->target, buf)) {
             if (unlink(sl) && errno != ENOENT) {
@@ -782,6 +819,7 @@ static int matchFollowers(struct alternativeSet *set,
                         set->alts[k].followers[i].facility,
                         set->alts[k].followers[i].title,
                         template.followers[j].facility, template.followers[j].title);
+                    free(newLinks);
                     return 2;
                 }
                 newLinks[j] = set->alts[k].followers[i];
@@ -1238,8 +1276,10 @@ static int listServices(const char *altDir, const char *stateDir, int flags) {
         if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
             continue;
 
-        if (readConfig(&set, ent->d_name, altDir, stateDir, flags))
+        if (readConfig(&set, ent->d_name, altDir, stateDir, flags)) {
+            closedir(dir);
             return 2;
+        }
 
         printf("%-*s\t%s\t%s\n", max_name, ent->d_name,
                set.mode == AUTO ? "auto  " : "manual", set.currentLink);
@@ -1253,7 +1293,9 @@ static int listServices(const char *altDir, const char *stateDir, int flags) {
 int main(int argc, const char **argv) {
     const char **nextArg;
     char *end;
-    char *title, *target, *followerTitle;
+    char *title = NULL;
+    char *target = NULL;
+    char *followerTitle = NULL;
     enum programModes mode = MODE_UNKNOWN;
     struct alternative newAlt = {-1, {NULL, NULL, NULL}, NULL, NULL, 0, NULL};
     int flags = 0;
@@ -1363,13 +1405,13 @@ int main(int argc, const char **argv) {
             nextArg++;
             if (!*nextArg)
                 usage(2);
-            altDir = strdup(normalize_path(*nextArg));
+            altDir = normalize_path_alloc(*nextArg);
             nextArg++;
         } else if (!strcmp(*nextArg, "--admindir")) {
             nextArg++;
             if (!*nextArg)
                 usage(2);
-            stateDir = strdup(normalize_path(*nextArg));
+            stateDir = normalize_path_alloc(*nextArg);
             nextArg++;
         } else if (!strcmp(*nextArg, "--list")) {
             if (mode != MODE_UNKNOWN)
@@ -1383,12 +1425,12 @@ int main(int argc, const char **argv) {
 
     if (stat(altDir, &sb) || !S_ISDIR(sb.st_mode) || access(altDir, F_OK)) {
         fprintf(stderr, _("altdir %s invalid\n"), altDir);
-        return (2);
+        exit(2);
     }
 
     if (stat(stateDir, &sb) || !S_ISDIR(sb.st_mode) || access(stateDir, F_OK)) {
         fprintf(stderr, _("admindir %s invalid\n"), stateDir);
-        return (2);
+        exit(2);
     }
 
     switch (mode) {
